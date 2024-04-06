@@ -232,7 +232,7 @@ static int ads1x1x_write_reg(const struct device *dev, enum ads1x1x_reg reg_addr
 	return 0;
 }
 
-static int ads1x1x_start_conversion(const struct device *dev)
+static int ads1x1x_start_conversion(const struct device *dev, uint32_t mux)
 {
 	/* send start sampling command */
 	uint16_t config;
@@ -243,6 +243,8 @@ static int ads1x1x_start_conversion(const struct device *dev)
 		return ret;
 	}
 	config |= ADS1X1X_CONFIG_OS;
+	config &= ~ADS1X1X_CONFIG_MUX(7);
+	config |= ADS1X1X_CONFIG_MUX(mux);
 	ret = ads1x1x_write_reg(dev, ADS1X1X_REG_CONFIG, config);
 
 	return ret;
@@ -516,9 +518,16 @@ static int ads1x1x_validate_sequence(const struct device *dev, const struct adc_
 		return -ENOTSUP;
 	}
 
-	if (sequence->channels != BIT(0)) {
-		LOG_ERR("only channel 0 supported");
-		return -ENOTSUP;
+	if (config->multiplexer) {
+		if (sequence->channels - 1 > 0x7) {
+			LOG_ERR("unsupported MUX configuration: 0x%x", sequence->channels);
+			return -ENOTSUP;
+		}
+	} else {
+		if (sequence->channels != BIT(0)) {
+			LOG_ERR("only channel 0 supported");
+			return -ENOTSUP;
+		}
 	}
 
 	if (sequence->oversampling) {
@@ -551,7 +560,7 @@ static void adc_context_start_sampling(struct adc_context *ctx)
 
 	data->repeat_buffer = data->buffer;
 
-	ret = ads1x1x_start_conversion(data->dev);
+	ret = ads1x1x_start_conversion(data->dev, ctx->sequence.channels);
 	if (ret != 0) {
 		/* if we fail to complete the I2C operations to start
 		 * sampling, return an immediate error (likely -EIO) rather
