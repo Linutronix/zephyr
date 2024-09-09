@@ -31,6 +31,7 @@ LOG_MODULE_REGISTER(ADS1X1X, CONFIG_ADC_LOG_LEVEL);
 #endif
 
 #define ADS1X1X_CONFIG_OS BIT(15)
+#define ADS1X1X_CONFIG_MUX_MASK	0x7
 #define ADS1X1X_CONFIG_MUX(x) ((x) << 12)
 #define ADS1X1X_CONFIG_PGA(x) ((x) << 9)
 #define ADS1X1X_CONFIG_MODE BIT(8)
@@ -40,6 +41,8 @@ LOG_MODULE_REGISTER(ADS1X1X, CONFIG_ADC_LOG_LEVEL);
 #define ADS1X1X_CONFIG_COMP_LAT BIT(2)
 #define ADS1X1X_CONFIG_COMP_QUE(x) (x)
 #define ADS1X1X_THRES_POLARITY_ACTIVE BIT(15)
+
+#define ADS1X1X_MAX_MUX	8
 
 enum ads1x1x_reg {
 	ADS1X1X_REG_CONV = 0x00,
@@ -154,6 +157,9 @@ struct ads1x1x_data {
 	struct k_thread thread;
 	k_tid_t	tid;
 	bool differential;
+	uint8_t mux_active;
+	uint8_t channel_active;
+	uint8_t channel_mux[ADS1X1X_MAX_MUX];
 #ifdef ADC_ADS1X1X_TRIGGER
 	struct gpio_callback gpio_cb;
 	struct k_work work;
@@ -232,18 +238,23 @@ static int ads1x1x_write_reg(const struct device *dev, enum ads1x1x_reg reg_addr
 	return 0;
 }
 
-static int ads1x1x_start_conversion(const struct device *dev)
+static int ads1x1x_start_conversion(const struct device *dev, uint8_t mux)
 {
+	const struct ads1x1x_config *config = dev->config;
 	/* send start sampling command */
-	uint16_t config;
+	uint16_t val;
 	int ret;
 
-	ret = ads1x1x_read_reg(dev, ADS1X1X_REG_CONFIG, &config);
+	ret = ads1x1x_read_reg(dev, ADS1X1X_REG_CONFIG, &val);
 	if (ret != 0) {
 		return ret;
 	}
-	config |= ADS1X1X_CONFIG_OS;
-	ret = ads1x1x_write_reg(dev, ADS1X1X_REG_CONFIG, config);
+	if (config->multiplexer) {
+		val &= ~ADS1X1X_CONFIG_MUX_MASK;
+		val |= ADS1X1X_CONFIG_MUX(mux);
+	}
+	val |= ADS1X1X_CONFIG_OS;
+	ret = ads1x1x_write_reg(dev, ADS1X1X_REG_CONFIG, val);
 
 	return ret;
 }
@@ -380,9 +391,10 @@ static int ads1x1x_channel_setup(const struct device *dev,
 	const struct ads1x1x_config *ads_config = dev->config;
 	struct ads1x1x_data *data = dev->data;
 	uint16_t config = 0;
+	uint8_t mux;
 	int dr = 0;
 
-	if (channel_cfg->channel_id != 0) {
+	if (channel_cfg->channel_id >= ADS1X1X_MAX_MUX) {
 		LOG_ERR("unsupported channel id '%d'", channel_cfg->channel_id);
 		return -ENOTSUP;
 	}
@@ -396,16 +408,16 @@ static int ads1x1x_channel_setup(const struct device *dev,
 		/* the device has an input multiplexer */
 		if (channel_cfg->differential) {
 			if (channel_cfg->input_positive == 0 && channel_cfg->input_negative == 1) {
-				config |= ADS1X1X_CONFIG_MUX(ADS1X15_CONFIG_MUX_DIFF_0_1);
+				mux = ADS1X15_CONFIG_MUX_DIFF_0_1;
 			} else if (channel_cfg->input_positive == 0 &&
 				   channel_cfg->input_negative == 3) {
-				config |= ADS1X1X_CONFIG_MUX(ADS1X15_CONFIG_MUX_DIFF_0_3);
+				mux = ADS1X15_CONFIG_MUX_DIFF_0_3;
 			} else if (channel_cfg->input_positive == 1 &&
 				   channel_cfg->input_negative == 3) {
-				config |= ADS1X1X_CONFIG_MUX(ADS1X15_CONFIG_MUX_DIFF_1_3);
+				mux = ADS1X15_CONFIG_MUX_DIFF_1_3;
 			} else if (channel_cfg->input_positive == 2 &&
 				   channel_cfg->input_negative == 3) {
-				config |= ADS1X1X_CONFIG_MUX(ADS1X15_CONFIG_MUX_DIFF_2_3);
+				mux = ADS1X15_CONFIG_MUX_DIFF_2_3;
 			} else {
 				LOG_ERR("unsupported input positive '%d' and input negative '%d'",
 					channel_cfg->input_positive, channel_cfg->input_negative);
@@ -413,20 +425,33 @@ static int ads1x1x_channel_setup(const struct device *dev,
 			}
 		} else {
 			if (channel_cfg->input_positive == 0) {
-				config |= ADS1X1X_CONFIG_MUX(ADS1X15_CONFIG_MUX_SINGLE_0);
+				mux = ADS1X15_CONFIG_MUX_SINGLE_0;
 			} else if (channel_cfg->input_positive == 1) {
-				config |= ADS1X1X_CONFIG_MUX(ADS1X15_CONFIG_MUX_SINGLE_1);
+				mux = ADS1X15_CONFIG_MUX_SINGLE_1;
 			} else if (channel_cfg->input_positive == 2) {
-				config |= ADS1X1X_CONFIG_MUX(ADS1X15_CONFIG_MUX_SINGLE_2);
+				mux = ADS1X15_CONFIG_MUX_SINGLE_2;
 			} else if (channel_cfg->input_positive == 3) {
-				config |= ADS1X1X_CONFIG_MUX(ADS1X15_CONFIG_MUX_SINGLE_3);
+				mux = ADS1X15_CONFIG_MUX_SINGLE_3;
 			} else {
 				LOG_ERR("unsupported input positive '%d'",
 					channel_cfg->input_positive);
 				return -ENOTSUP;
 			}
 		}
+		if (data->mux_active & BIT(mux)) {
+			LOG_ERR("MUX configuration already active");
+				return -ENOTSUP;
+		}
+		data->mux_active |= BIT(mux);
+		data->channel_active |= BIT(channel_cfg->channel_id);
+		data->channel_mux[channel_cfg->channel_id] = mux;
 	} else {
+		if (channel_cfg->channel_id != 0) {
+			LOG_ERR("unsupported channel id '%d'", channel_cfg->channel_id)\
+;
+			return -ENOTSUP;
+		}
+
 		/* only differential supported without multiplexer */
 		if (!((channel_cfg->differential) &&
 		      (channel_cfg->input_positive == 0 && channel_cfg->input_negative == 1))) {
@@ -434,6 +459,7 @@ static int ads1x1x_channel_setup(const struct device *dev,
 				channel_cfg->input_positive, channel_cfg->input_negative);
 			return -ENOTSUP;
 		}
+		data->channel_active |= BIT(channel_cfg->channel_id);
 	}
 	/* store differential mode to determine supported resolution */
 	data->differential = channel_cfg->differential;
@@ -509,6 +535,7 @@ static int ads1x1x_validate_sequence(const struct device *dev, const struct adc_
 	const struct ads1x1x_config *config = dev->config;
 	struct ads1x1x_data *data = dev->data;
 	uint8_t resolution = data->differential ? config->resolution : config->resolution - 1;
+	uint8_t unconfigured;
 	int err;
 
 	if (sequence->resolution != resolution) {
@@ -516,8 +543,16 @@ static int ads1x1x_validate_sequence(const struct device *dev, const struct adc_
 		return -ENOTSUP;
 	}
 
-	if (sequence->channels != BIT(0)) {
-		LOG_ERR("only channel 0 supported");
+	if (POPCOUNT(sequence->channels) != 1) {
+		LOG_ERR("only one channel per conversion sequence allowed");
+		return -ENOTSUP;
+	}
+
+	unconfigured = sequence->channels;
+	unconfigured &= ~data->channel_active;
+
+	if (unconfigured) {
+		LOG_ERR("unconfigured channel 0x%x", unconfigured);
 		return -ENOTSUP;
 	}
 
@@ -547,11 +582,13 @@ static void adc_context_update_buffer_pointer(struct adc_context *ctx, bool repe
 static void adc_context_start_sampling(struct adc_context *ctx)
 {
 	struct ads1x1x_data *data = CONTAINER_OF(ctx, struct ads1x1x_data, ctx);
+	uint8_t mux;
 	int ret;
 
 	data->repeat_buffer = data->buffer;
 
-	ret = ads1x1x_start_conversion(data->dev);
+	mux = data->channel_mux[ctx->sequence.channels];
+	ret = ads1x1x_start_conversion(data->dev, mux);
 	if (ret != 0) {
 		/* if we fail to complete the I2C operations to start
 		 * sampling, return an immediate error (likely -EIO) rather
